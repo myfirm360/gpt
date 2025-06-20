@@ -8,19 +8,17 @@ import re
 
 app = Flask(__name__)
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 ASSISTANT_ID = "asst_BKqfAhqCEgH5H1MG2kP5hfEP"
 
-
-# ── Clean + prepare Slack-friendly markdown ───────────────────────────────────
+# ── Clean text for Slack (citations + bold) ───────────────────────────────────
 def clean_for_slack(text: str) -> str:
-    text = re.sub(r"【[^】]+】", "", text)          # Remove citation markers
+    text = re.sub(r"【[^】]+】", "", text)          # Remove citations
     text = re.sub(r"\*\*(.*?)\*\*", r"*\1*", text)  # Convert **bold** to *bold*
     return text.strip()
 
-
-# ── Build Slack block layout from a text string ───────────────────────────────
+# ── Format Slack Block Kit message ────────────────────────────────────────────
 def build_slack_blocks(text: str):
-    # Split into "title", "body", and "footer" if needed
     lines = text.strip().split("\n")
     if not lines:
         return []
@@ -33,7 +31,7 @@ def build_slack_blocks(text: str):
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*{title_line}*"
+                "text": title_line  # Let Slack handle bolding if GPT included it
             }
         },
         {
@@ -55,39 +53,30 @@ def build_slack_blocks(text: str):
         }
     ]
 
-
-# ── GPT thread processor ──────────────────────────────────────────────────────
+# ── Process assistant reply and respond to Slack ──────────────────────────────
 def handle_assistant_interaction(user_input: str, response_url: str):
     try:
-        # 1. Create thread
         thread = client.beta.threads.create()
 
-        # 2. Add message
         client.beta.threads.messages.create(
             thread_id=thread.id,
             role="user",
             content=user_input
         )
 
-        # 3. Run the assistant
         run = client.beta.threads.runs.create(
             thread_id=thread.id,
             assistant_id=ASSISTANT_ID
         )
 
-        # 4. Poll until completion
         while True:
-            status = client.beta.threads.runs.retrieve(
-                thread_id=thread.id,
-                run_id=run.id
-            )
+            status = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
             if status.status == "completed":
                 break
             elif status.status in {"failed", "cancelled"}:
                 raise Exception(f"Assistant run {status.status}")
             time.sleep(1.3)
 
-        # 5. Fetch reply
         msgs = client.beta.threads.messages.list(thread_id=thread.id)
         raw_reply = next(
             (m.content[0].text.value for m in msgs.data if m.role == "assistant"),
@@ -98,7 +87,7 @@ def handle_assistant_interaction(user_input: str, response_url: str):
         blocks = build_slack_blocks(cleaned)
 
     except Exception as e:
-        print("Error:", e, flush=True)
+        print("Assistant error:", e, flush=True)
         blocks = [
             {
                 "type": "section",
@@ -109,7 +98,6 @@ def handle_assistant_interaction(user_input: str, response_url: str):
             }
         ]
 
-    # 6. Post to Slack
     try:
         requests.post(
             response_url,
@@ -122,8 +110,7 @@ def handle_assistant_interaction(user_input: str, response_url: str):
     except Exception as post_err:
         print("Slack post error:", post_err, flush=True)
 
-
-# ── Slack slash command endpoint ──────────────────────────────────────────────
+# ── Slack endpoint ────────────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     user_input = request.form.get("text", "").strip()
@@ -132,7 +119,7 @@ def slack_events():
     if not user_input:
         return jsonify({
             "response_type": "ephemeral",
-            "text": "⚠️ Try `/customgpt your question…`"
+            "text": "⚠️ Please include a question. Try `/customgpt How do we onboard new clients?`"
         }), 200
 
     threading.Thread(
@@ -145,8 +132,7 @@ def slack_events():
         "text": "⏳ Got it! I’ll post your answer here shortly."
     }), 200
 
-
 # ── Health check ──────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
-    return "Firm360 Slack Assistant with Block Kit is live ✅", 200
+    return "Firm360 Slack Assistant with rich formatting is live ✅", 200
