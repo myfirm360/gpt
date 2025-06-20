@@ -1,4 +1,5 @@
 # Pin versions that work with the new OpenAI v1+ SDK
 Flask==3.0.3
 openai>=1.21.0
+requests==2.31.0
 gunicorn==22.0.0
