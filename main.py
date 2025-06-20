@@ -3,44 +3,64 @@ import openai
 import os
 import threading
 import requests
+import time
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ── Background Thread: Sends GPT response to Slack after initial reply ───────
-def process_and_respond(user_input, response_url):
-    system_prompt = (
-        "You are a helpful assistant trained specifically to answer "
-        "Firm360-related queries for internal team members. Be concise and friendly."
-    )
+# Your Assistant ID from OpenAI
+ASSISTANT_ID = "asst_BKqfAhqCEgH5H1MG2kP5hfEP"
 
+# ── Threaded processing to handle Slack & Assistant delay ─────────────────────
+def handle_assistant_interaction(user_input, response_url):
     try:
-        completion = client.chat.completions.create(
-            model="gpt-4o",  # Faster, avoids timeouts
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_input}
-            ],
+        # Step 1: Create a thread
+        thread = client.beta.threads.create()
+
+        # Step 2: Add user's message to thread
+        client.beta.threads.messages.create(
+            thread_id=thread.id,
+            role="user",
+            content=user_input
         )
 
-        reply = completion.choices[0].message.content
+        # Step 3: Run the assistant
+        run = client.beta.threads.runs.create(
+            thread_id=thread.id,
+            assistant_id=ASSISTANT_ID,
+        )
+
+        # Step 4: Wait for completion
+        while True:
+            run_status = client.beta.threads.runs.retrieve(
+                thread_id=thread.id,
+                run_id=run.id
+            )
+            if run_status.status == "completed":
+                break
+            elif run_status.status in ["failed", "cancelled"]:
+                raise Exception(f"Assistant run {run_status.status}")
+            time.sleep(1.5)  # Polling delay
+
+        # Step 5: Get the assistant’s reply
+        messages = client.beta.threads.messages.list(thread_id=thread.id)
+        reply = next(
+            (msg.content[0].text.value for msg in messages.data if msg.role == "assistant"),
+            "⚠️ No reply from assistant."
+        )
 
     except Exception as e:
-        reply = f"⚠️ Sorry, something went wrong: {e}"
+        print("Error with Assistant API:", e)
+        reply = f"⚠️ Something went wrong: {e}"
 
-    # Send the response back to Slack via the response_url
-    payload = {
+    # Step 6: Send response back to Slack
+    requests.post(response_url, json={
         "response_type": "in_channel",
         "text": reply
-    }
+    })
 
-    try:
-        requests.post(response_url, json=payload)
-    except Exception as post_err:
-        print("Error posting back to Slack:", post_err)
 
-# ── Slack Slash Command Endpoint ──────────────────────────────────────────────
+# ── Slack webhook endpoint ─────────────────────────────────────────────────────
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     user_input = request.form.get("text", "")
@@ -49,20 +69,21 @@ def slack_events():
     if not user_input:
         return jsonify({
             "response_type": "ephemeral",
-            "text": "⚠️ I didn’t catch that. Try `/customgpt your question…`"
+            "text": "⚠️ Please include a prompt. Try `/customgpt your question...`"
         }), 200
 
-    # Start background thread
-    thread = threading.Thread(target=process_and_respond, args=(user_input, response_url))
+    # Run assistant response in a background thread
+    thread = threading.Thread(target=handle_assistant_interaction, args=(user_input, response_url))
     thread.start()
 
-    # Immediate response to avoid timeout
+    # Respond to Slack immediately to avoid timeout
     return jsonify({
         "response_type": "ephemeral",
-        "text": "⏳ Thinking… I'll post the answer here shortly!"
+        "text": "⏳ Thinking... I'll post the answer shortly!"
     }), 200
 
-# ── Optional health check ─────────────────────────────────────────────────────
+
+# ── Health check endpoint ──────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
-    return "Slack GPT bot is running ✅", 200
+    return "Slack Assistant is live!", 200
