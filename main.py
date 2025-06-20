@@ -1,69 +1,68 @@
 from flask import Flask, request, jsonify
 import openai
 import os
+import threading
+import requests
 
-# ── Flask app ──────────────────────────────────────────────────────────────────
+# ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ── OpenAI client (v1+ SDK) ────────────────────────────────────────────────────
-client = openai.OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")  # make sure this is set on Render
-)
-
-# ── Slack slash-command endpoint ───────────────────────────────────────────────
-@app.route("/slack/events", methods=["POST"])
-def slack_events() -> tuple:
-    """Handle POST requests coming from Slack slash commands."""
-    user_input: str = request.form.get("text", "")
-    user_id: str = request.form.get("user_id", "unknown-user")
-
-    # Graceful fallback if the command was sent with no text
-    if not user_input.strip():
-        return jsonify(
-            response_type="ephemeral",
-            text="⚠️ I didn’t catch that. Try `/customgpt your question…`",
-        ), 200
-
-    # System prompt – tweak to taste
+# ── Background Thread: Sends GPT response to Slack after initial reply ───────
+def process_and_respond(user_input, response_url):
     system_prompt = (
         "You are a helpful assistant trained specifically to answer "
-        "Firm360-related queries for internal team members. "
-        "Be concise and friendly."
+        "Firm360-related queries for internal team members. Be concise and friendly."
     )
 
     try:
         completion = client.chat.completions.create(
-            model="gpt-4o-mini",                 # change if you prefer a different model
+            model="gpt-4o",  # Faster, avoids timeouts
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_input},
+                {"role": "user", "content": user_input}
             ],
         )
 
-        reply: str = completion.choices[0].message.content
+        reply = completion.choices[0].message.content
 
-        return (
-            jsonify(
-                response_type="in_channel",  # visible to everyone in the channel
-                text=reply,
-            ),
-            200,
-        )
+    except Exception as e:
+        reply = f"⚠️ Sorry, something went wrong: {e}"
 
-    except Exception as exc:
-        # Log the exception for Render logs & return an ephemeral error to Slack
-        print("OpenAI or server error:", exc, flush=True)
-        return (
-            jsonify(
-                response_type="ephemeral",
-                text=f"⚠️ Something went wrong: {exc}",
-            ),
-            200,
-        )
+    # Send the response back to Slack via the response_url
+    payload = {
+        "response_type": "in_channel",
+        "text": reply
+    }
 
+    try:
+        requests.post(response_url, json=payload)
+    except Exception as post_err:
+        print("Error posting back to Slack:", post_err)
 
-# ── Health-check endpoint (optional) ───────────────────────────────────────────
+# ── Slack Slash Command Endpoint ──────────────────────────────────────────────
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    user_input = request.form.get("text", "")
+    response_url = request.form.get("response_url", "")
+
+    if not user_input:
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": "⚠️ I didn’t catch that. Try `/customgpt your question…`"
+        }), 200
+
+    # Start background thread
+    thread = threading.Thread(target=process_and_respond, args=(user_input, response_url))
+    thread.start()
+
+    # Immediate response to avoid timeout
+    return jsonify({
+        "response_type": "ephemeral",
+        "text": "⏳ Thinking… I'll post the answer here shortly!"
+    }), 200
+
+# ── Optional health check ─────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
-    """Simple ping endpoint so Render shows a page."""
-    return "Slack GPT bot is live 🚀", 200
+    return "Slack GPT bot is running ✅", 200
